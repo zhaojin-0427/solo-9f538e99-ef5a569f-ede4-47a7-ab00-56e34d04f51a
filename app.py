@@ -91,10 +91,12 @@ def create_app(db_path: str | None = None) -> Flask:
                 day_data = core.get_day_readback(get_db(), day)
             except core.ValidationError as exc:
                 flash(exc.message, "error")
+        pending = core.list_pending_prechecks(get_db())
         return render_template(
             "index.html",
             today=core.date.today().isoformat(),
             day_data=day_data,
+            pending=pending,
         )
 
     @app.get("/day")
@@ -138,7 +140,30 @@ def create_app(db_path: str | None = None) -> Flask:
             else:
                 raise core.ValidationError("请选择 CSV 文件，或粘贴 CSV 文本")
             tickets = core.parse_csv_text(text)
-            summary = core.replace_day_tickets(get_db(), day, tickets)
+            conn = get_db()
+            submitted_at = first_value("submitted_at") or None
+            submitted_by = first_value("submitted_by", "operator") or None
+            # The submission is stamped before comparing, so an upload that
+            # started earlier can never overwrite a later one that committed
+            # while this one was still being checked.
+            submission_seq = core.allocate_submission(conn)
+            precheck = core.precheck_tickets(
+                conn, day, tickets, submission_seq=submission_seq
+            )
+            if precheck["hit"]:
+                # Held out of the database until a reviewer confirms it.
+                summary = None
+            else:
+                summary = core.commit_reported_day(
+                    conn,
+                    day,
+                    tickets,
+                    submission_seq=submission_seq,
+                    submitted_at=submitted_at,
+                    submitted_by=submitted_by,
+                )
+        except core.PrecheckStale as exc:
+            return error_response(exc.message, status=409)
         except core.ValidationError as exc:
             return error_response(exc.message, errors=exc.errors)
         except sqlite3.Error as exc:  # pragma: no cover - defensive
@@ -146,7 +171,22 @@ def create_app(db_path: str | None = None) -> Flask:
             return error_response(f"数据库写入失败，已回滚，旧数据仍可查询：{exc}", status=500)
 
         if wants_json():
-            return jsonify(ok=True, **summary, filename=filename)
+            if precheck["hit"]:
+                return jsonify(
+                    ok=True,
+                    stored=False,
+                    precheck=to_jsonable(precheck),
+                    filename=filename,
+                ), 202
+            return jsonify(ok=True, stored=True, **summary, precheck=to_jsonable(precheck), filename=filename)
+
+        if precheck["hit"]:
+            flash(
+                f"{precheck['date']} 与窗口内 {precheck['match_count']} 个日报命中重合规则，"
+                "已暂存待质控员核对，尚未入库。",
+                "warning",
+            )
+            return redirect(url_for("precheck_view", precheck_id=precheck["precheck_id"]), code=303)
 
         flash(
             f"已整日替换 {summary['date']}：旧 {summary['old_count']} 单，"
@@ -154,6 +194,59 @@ def create_app(db_path: str | None = None) -> Flask:
             "success",
         )
         return redirect(url_for("day_view", date=summary["date"], uploaded=1), code=303)
+
+    @app.get("/precheck/<int:precheck_id>")
+    def precheck_view(precheck_id: int):
+        data = core.get_precheck(get_db(), precheck_id)
+        if data is None:
+            flash("预检记录不存在。", "error")
+            return redirect(url_for("index"), code=303)
+        return render_template(
+            "precheck.html",
+            precheck=data,
+            today=core.date.today().isoformat(),
+        )
+
+    @app.post("/confirm")
+    def confirm():
+        raw_id = first_value("precheck_id", "id")
+        try:
+            precheck_id = int(raw_id)
+        except (TypeError, ValueError):
+            return error_response("precheck_id 必须是整数")
+        try:
+            result = core.confirm_precheck(
+                get_db(),
+                precheck_id,
+                submitted_at=first_value("submitted_at") or None,
+                submitted_by=first_value("submitted_by", "operator") or None,
+            )
+        except core.PrecheckStale as exc:
+            if wants_json():
+                return jsonify(
+                    ok=False,
+                    error=exc.message,
+                    stale_dates=exc.stale_dates,
+                ), 409
+            flash(
+                f"{exc.message}（变动日期：{'、'.join(exc.stale_dates)}）",
+                "error",
+            )
+            return redirect(url_for("precheck_view", precheck_id=precheck_id), code=303)
+        except core.ValidationError as exc:
+            return error_response(exc.message, status=409)
+        except sqlite3.Error as exc:  # pragma: no cover - defensive
+            app.logger.exception("database failure during confirm")
+            return error_response(f"确认失败，已回滚：{exc}", status=500)
+
+        if wants_json():
+            return jsonify(ok=True, **to_jsonable(result))
+        flash(
+            f"已确认原稿 {result['date']}：{result['new_count']} 单入库，"
+            f"命中 {result['match_count']} 个日报。",
+            "success",
+        )
+        return redirect(url_for("day_view", date=result["date"], confirmed=1), code=303)
 
     @app.post("/hold")
     def hold():
@@ -250,11 +343,30 @@ def create_app(db_path: str | None = None) -> Flask:
     def api_release_alias():
         return release()
 
+    @app.post("/api/confirm")
+    def api_confirm_alias():
+        return confirm()
+
+    @app.get("/api/precheck")
+    @app.get("/api/prechecks")
+    def api_precheck_list():
+        target = first_value("date", "target_date") or None
+        try:
+            pending = core.list_pending_prechecks(get_db(), target)
+        except core.ValidationError as exc:
+            return jsonify(ok=False, error=exc.message), 400
+        return jsonify(ok=True, pending=to_jsonable(pending))
+
     @app.errorhandler(404)
     def not_found(_):
         if wants_json():
             return jsonify(ok=False, error="not found"), 404
-        return render_template("index.html", today=core.date.today().isoformat(), day_data=None), 404
+        return render_template(
+            "index.html",
+            today=core.date.today().isoformat(),
+            day_data=None,
+            pending=[],
+        ), 404
 
     return app
 

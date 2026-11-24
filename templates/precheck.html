@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}重合预检 {{ precheck.target_date }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-head">
+    <h1>重报重合核对 · {{ precheck.target_date }}</h1>
+    <a class="btn" href="{{ url_for('index') }}">返回首页</a>
+  </div>
+  <p class="hint">
+    地磅导出的 CSV 不含日期。为避免选错日期把同一批车计两遍，系统核对了所选日前后各 7 天
+    （{{ precheck.window_start }} 至 {{ precheck.window_end }}，跨年同样检查）已在库的日报。
+    当本次来稿与某个日报各至少有 100 单，且“单号 + 净重”都相同的票数占双方各自票数的比例
+    均达到 95% 时，列出该命中日。命中时本次原稿<b>尚未入库</b>。
+  </p>
+
+  {% if precheck.state == 'confirmed' %}
+  <div class="flash flash-success">该预检已由质控员确认，原稿已入库；本页保留为审计依据。</div>
+  {% elif precheck.stale_dates %}
+  <div class="flash flash-error">
+    预检后目标日或窗口内有日报新报或换报（{{ precheck.stale_dates|join('、') }}），
+    此结果已过期，必须重新上传核对后才能确认。
+  </div>
+  {% endif %}
+
+  <table class="data">
+    <thead>
+      <tr>
+        <th>命中日</th>
+        <th>本稿票数</th>
+        <th>命中日票数</th>
+        <th>单号与净重均相同</th>
+        <th>占本稿</th>
+        <th>占命中日</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for match in precheck.matches %}
+      <tr>
+        <td><a href="{{ url_for('day_view', date=match.date) }}">{{ match.date }}</a></td>
+        <td class="num">{{ match.target_count }}</td>
+        <td class="num">{{ match.other_count }}</td>
+        <td class="num">{{ match.matched }}</td>
+        <td class="num">{{ match.target_ratio }}%</td>
+        <td class="num">{{ match.other_ratio }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="meter">
+    本稿 {{ precheck.target_count }} 单；命中 {{ precheck.match_count }} 个日报；
+    判定门槛：双方各 ≥ 100 单，且双方重合比例均 ≥ 95%。
+  </p>
+
+  <div class="button-row">
+    {% if precheck.state == 'pending' %}
+    <form method="post" action="{{ url_for('confirm') }}">
+      <input type="hidden" name="precheck_id" value="{{ precheck.id }}">
+      <input type="hidden" name="submitted_at" value="{{ precheck.created_at }}">
+      <button class="btn primary" type="submit" {% if precheck.stale_dates %}disabled title="预检已过期，请重新上传核对"{% endif %}>
+        质控员核实无误，确认原稿入库
+      </button>
+    </form>
+    {% endif %}
+    <form method="post" action="{{ url_for('upload') }}">
+      <input type="hidden" name="date" value="{{ precheck.target_date }}">
+      <label class="field">
+        <span>{% if precheck.state == 'pending' %}重新核对{% else %}更新该日原稿{% endif %}：粘贴 CSV</span>
+        <textarea name="csv_text" rows="3" placeholder="单号,净重&#10;A-1001,32000"></textarea>
+      </label>
+      <button class="btn" type="submit">{% if precheck.state == 'pending' %}重新预检{% else %}上传并预检{% endif %}</button>
+    </form>
+  </div>
+  <p class="hint">确认只写入质控员看到的这份原稿；若确认前目标日或窗口内出现新报或换报，确认会被拒绝并要求重新核对。</p>
+</section>
+{% endblock %}

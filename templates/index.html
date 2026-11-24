@@ -3,7 +3,7 @@
 <div class="grid">
   <section class="card" id="upload">
     <h1>CSV 上传 / 整日替换</h1>
-    <p class="hint">选择日期并上传 CSV。同一日期上传会以新文件<b>整日替换</b>；暂扣记录按“日期 + 单号”保留，不会因重报或单号暂时缺失而丢失。</p>
+    <p class="hint">选择日期并上传 CSV。同一日期上传会以新文件<b>整日替换</b>；暂扣记录按“日期 + 单号”保留，不会因重报或单号暂时缺失而丢失。写入前会核对所选日前后各 7 天的在用日报；命中“单号+净重”重合规则时先不入库，等质控员确认。</p>
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data" class="form">
       <div class="field">
         <label for="upload-date">单据日期</label>
@@ -73,6 +73,33 @@
   <p class="hint">区间必须包含单据日期；按净重降序。同重单据共用从“更高票数 + 1”到“更高票数 + 同重票数”的名次区间。</p>
 </section>
 
+{% if pending %}
+<section class="card" id="pending-prechecks">
+  <h2>待质控员核对的命中预检</h2>
+  <p class="hint">下列来稿与窗口内日报重合达到门槛，暂未入库。确认前若目标日或窗口内有新报/换报，需重新核对。</p>
+  <table class="data">
+    <thead><tr><th>来稿日期</th><th>票数</th><th>命中日报数</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for item in pending %}
+      <tr class="{{ 'held-row' if item.stale_dates else '' }}">
+        <td>{{ item.target_date }}</td>
+        <td class="num">{{ item.target_count }}</td>
+        <td class="num">{{ item.match_count }}</td>
+        <td>
+          {% if item.stale_dates %}
+            <span class="badge held">已过期</span> {{ item.stale_dates|join('、') }}
+          {% else %}
+            <span class="badge warn-text">待核对</span>
+          {% endif %}
+        </td>
+        <td><a class="btn small" href="{{ url_for('precheck_view', precheck_id=item.id) }}">查看并确认</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 {% if day_data %}
 <section class="card" id="day-readback">
   <h2>{{ day_data.date }} 当天原单回读</h2>
@@ -84,7 +111,8 @@
   <h2>接口与示例</h2>
   <ul>
     <li>名次 JSON：<code>GET /api/rank?date=2026-05-01&amp;ticket_no=B&amp;start=2026-01-01&amp;end=2026-12-31</code></li>
-    <li>上传：<code>POST /upload</code>，表单字段 <code>date</code> 与文件 <code>file</code>。</li>
+    <li>上传：<code>POST /upload</code>（或 <code>/api/upload</code>），表单字段 <code>date</code> 与文件 <code>file</code>。命中重合时返回 <code>202</code> 且 <code>stored=false</code>。</li>
+    <li>待核对列表：<code>GET /api/precheck?date=YYYY-MM-DD</code>；确认入库：<code>POST /confirm</code>，字段 <code>precheck_id</code>。</li>
     <li>暂扣 / 解除：<code>POST /hold</code>、<code>POST /release</code>。</li>
   </ul>
 </section>

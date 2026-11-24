@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import csv
 import io
-import math
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, Iterable, Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 
 WEIGHT_MIN = 0
@@ -222,6 +222,64 @@ CREATE TABLE IF NOT EXISTS subtotals (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_holds_date ON holds(slip_date);
+
+-- Independent per-date upload generation. Every whole-day replacement or
+-- first report of a date gets a new generation, even when the ticket rows are
+-- identical. Confirmations bind to the generation they were checked against.
+CREATE TABLE IF NOT EXISTS day_reports (
+    slip_date    TEXT PRIMARY KEY,
+    generation   INTEGER NOT NULL CHECK (generation >= 1),
+    ticket_count INTEGER NOT NULL DEFAULT 0 CHECK (ticket_count >= 0),
+    reported_at  TEXT NOT NULL DEFAULT (datetime('now'))
+) WITHOUT ROWID;
+
+-- A compare-before-commit review. It lists every neighbor day whose ticket
+-- set overlaps this report by at least 95% on both sides (and 100 tickets on
+-- each side). Rows are kept after confirmation as an audit trail.
+CREATE TABLE IF NOT EXISTS precheck_reports (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_date      TEXT NOT NULL,
+    target_gen       INTEGER NOT NULL,
+    target_count     INTEGER NOT NULL,
+    window_start     TEXT NOT NULL,
+    window_end       TEXT NOT NULL,
+    window_json      TEXT NOT NULL,
+    ticket_json      TEXT NOT NULL,
+    matches_json     TEXT NOT NULL,
+    match_count      INTEGER NOT NULL,
+    submission_seq   INTEGER NOT NULL DEFAULT 0,
+    state            TEXT NOT NULL CHECK (state IN ('pending', 'confirmed')),
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    confirmed_at     TEXT,
+    submitted_at     TEXT,
+    submitted_by     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_precheck_target
+    ON precheck_reports(target_date, state);
+
+-- Monotonic submission ordering. The write that lands for a date is decided
+-- under the same write lock as the ticket replacement, so a slower submission
+-- can never overwrite a later one that already committed.
+CREATE TABLE IF NOT EXISTS submission_seq (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    last_value  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS day_write_order (
+    slip_date    TEXT PRIMARY KEY,
+    last_written INTEGER NOT NULL
+) WITHOUT ROWID;
+"""
+
+# Legacy databases carry tickets but no day_reports rows. One INSERT..SELECT
+# per date backfills the generation/count metadata so old reports take part in
+# the overlap precheck without a per-ticket loop. Runs once per startup.
+SCHEMA_BACKFILL = """
+INSERT OR IGNORE INTO day_reports(slip_date, generation, ticket_count, reported_at)
+SELECT slip_date, 1, COUNT(*), datetime('now')
+FROM tickets
+GROUP BY slip_date;
 """
 
 
@@ -236,6 +294,7 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    conn.executescript(SCHEMA_BACKFILL)
 
 
 def init_db_path(db_path: str) -> None:
@@ -253,6 +312,19 @@ def init_db_path(db_path: str) -> None:
 
 @contextmanager
 def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    if conn.in_transaction:
+        # Nested use (e.g. confirm → replace) joins the caller's transaction so
+        # the whole operation still commits or rolls back as one unit.
+        savepoint = f"sp_{id(object()):x}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield
+            conn.execute(f"RELEASE {savepoint}")
+        except Exception:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+            raise
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -485,55 +557,148 @@ def adjust_existing_ticket_active(
 # ---------------------------------------------------------------------------
 
 
-def replace_day_tickets(
-    conn: sqlite3.Connection, slip_date: str, tickets: list[tuple[str, int]]
-) -> dict[str, int]:
-    day = parse_iso_date(slip_date, "上传日期")
-    date_text = day.isoformat()
+class _Superseded(Exception):
+    """A newer submission has already written this date."""
 
-    with write_transaction(conn):
-        old_rows = conn.execute(
-            "SELECT ticket_no, net_weight FROM tickets WHERE slip_date = ?",
-            (date_text,),
-        ).fetchall()
-        held_rows = conn.execute(
-            "SELECT ticket_no FROM holds WHERE slip_date = ?",
-            (date_text,),
-        ).fetchall()
-        held_numbers = {row["ticket_no"] for row in held_rows}
 
-        delta: dict[tuple[str, str, str], int] = {}
-        for row in old_rows:
-            add_ticket_to_delta(
-                delta,
-                date_text,
-                row["net_weight"],
-                held=row["ticket_no"] in held_numbers,
-                sign=-1,
-            )
-        for ticket_no, weight in tickets:
-            add_ticket_to_delta(
-                delta,
-                date_text,
-                weight,
-                held=ticket_no in held_numbers,
-                sign=+1,
-            )
+def _allocate_submission_seq(conn: sqlite3.Connection) -> int:
+    """Allocate the next submission order while holding the write lock.
 
-        conn.execute("DELETE FROM tickets WHERE slip_date = ?", (date_text,))
-        conn.executemany(
-            "INSERT INTO tickets(slip_date, ticket_no, net_weight) VALUES (?, ?, ?)",
-            [(date_text, no, weight) for no, weight in tickets],
+    The counter is captured when a report is first submitted (precheck) and
+    travels with that submission. A write therefore always orders after every
+    submission that started earlier, and a late confirmation carrying an old
+    counter can be rejected instead of overwriting a newer report.
+    """
+    conn.execute(
+        """
+        INSERT INTO submission_seq(id, last_value) VALUES (1, 1)
+        ON CONFLICT(id) DO UPDATE SET last_value = submission_seq.last_value + 1
+        """
+    )
+    row = conn.execute("SELECT last_value FROM submission_seq WHERE id = 1").fetchone()
+    return int(row["last_value"])
+
+
+def _claim_write_order(
+    conn: sqlite3.Connection, slip_date: str, submission_seq: int
+) -> None:
+    """Refuse a write older than one already committed for this date."""
+    row = conn.execute(
+        "SELECT last_written FROM day_write_order WHERE slip_date = ?",
+        (slip_date,),
+    ).fetchone()
+    if row is not None and int(row["last_written"]) > submission_seq:
+        raise _Superseded(slip_date)
+    conn.execute(
+        """
+        INSERT INTO day_write_order(slip_date, last_written) VALUES (?, ?)
+        ON CONFLICT(slip_date) DO UPDATE SET
+            last_written = MAX(day_write_order.last_written, excluded.last_written)
+        """,
+        (slip_date, submission_seq),
+    )
+
+
+def _bump_generation(
+    conn: sqlite3.Connection, slip_date: str, ticket_count: int
+) -> int:
+    """Assign a new upload generation to a date inside the current write tx."""
+    conn.execute(
+        """
+        INSERT INTO day_reports(slip_date, generation, ticket_count, reported_at)
+        VALUES (?, 1, ?, datetime('now'))
+        ON CONFLICT(slip_date) DO UPDATE SET
+            generation = day_reports.generation + 1,
+            ticket_count = excluded.ticket_count,
+            reported_at = excluded.reported_at
+        """,
+        (slip_date, ticket_count),
+    )
+    row = conn.execute(
+        "SELECT generation FROM day_reports WHERE slip_date = ?", (slip_date,)
+    ).fetchone()
+    return int(row["generation"])
+
+
+def _replace_day_tickets_locked(
+    conn: sqlite3.Connection,
+    date_text: str,
+    tickets: list[tuple[str, int]],
+    submission_seq: Optional[int] = None,
+) -> dict[str, object]:
+    """Whole-day replacement body. Caller must hold a write transaction."""
+    # The order check and the write share one lock, so the last submission
+    # before the write is the report that lands. A direct call without an
+    # explicit sequence is treated as the newest submission.
+    seq = submission_seq if submission_seq is not None else _allocate_submission_seq(conn)
+    _claim_write_order(conn, date_text, seq)
+
+    old_rows = conn.execute(
+        "SELECT ticket_no, net_weight FROM tickets WHERE slip_date = ?",
+        (date_text,),
+    ).fetchall()
+    held_rows = conn.execute(
+        "SELECT ticket_no FROM holds WHERE slip_date = ?",
+        (date_text,),
+    ).fetchall()
+    held_numbers = {row["ticket_no"] for row in held_rows}
+
+    delta: dict[tuple[str, str, str], int] = {}
+    for row in old_rows:
+        add_ticket_to_delta(
+            delta,
+            date_text,
+            row["net_weight"],
+            held=row["ticket_no"] in held_numbers,
+            sign=-1,
         )
-        changed_keys = apply_delta(conn, delta)
+    for ticket_no, weight in tickets:
+        add_ticket_to_delta(
+            delta,
+            date_text,
+            weight,
+            held=ticket_no in held_numbers,
+            sign=+1,
+        )
+
+    conn.execute("DELETE FROM tickets WHERE slip_date = ?", (date_text,))
+    conn.executemany(
+        "INSERT INTO tickets(slip_date, ticket_no, net_weight) VALUES (?, ?, ?)",
+        [(date_text, no, weight) for no, weight in tickets],
+    )
+    changed_keys = apply_delta(conn, delta)
+    generation = _bump_generation(conn, date_text, len(tickets))
+
+    # Any pending precheck whose window covers this date is now stale. No
+    # per-window row is written: the generation bump above is the staleness
+    # signal, so a report never waits on a comparison and its cost does not
+    # grow with the number of tickets on neighbor days.
+    affected = conn.execute(
+        """
+        SELECT id FROM precheck_reports
+        WHERE state = 'pending'
+          AND window_start <= ? AND window_end >= ?
+        """,
+        (date_text, date_text),
+    ).fetchall()
 
     return {
         "date": date_text,
         "old_count": len(old_rows),
         "new_count": len(tickets),
+        "generation": generation,
         "subtotal_delta_keys": changed_keys,
+        "invalidated_pending": [int(row["id"]) for row in affected],
     }
 
+
+def replace_day_tickets(
+    conn: sqlite3.Connection, slip_date: str, tickets: list[tuple[str, int]]
+) -> dict[str, object]:
+    day = parse_iso_date(slip_date, "上传日期")
+    date_text = day.isoformat()
+    with write_transaction(conn):
+        return _replace_day_tickets_locked(conn, date_text, tickets)
 
 def _get_ticket_row(conn: sqlite3.Connection, day: str, ticket_no: str) -> Optional[sqlite3.Row]:
     return conn.execute(
@@ -626,6 +791,9 @@ def release_ticket(conn: sqlite3.Connection, slip_date: str, ticket_no: str) -> 
 
 def get_day_readback(conn: sqlite3.Connection, slip_date: str) -> dict[str, object]:
     day = parse_iso_date(slip_date, "日期").isoformat()
+    generation_row = conn.execute(
+        "SELECT generation FROM day_reports WHERE slip_date = ?", (day,)
+    ).fetchone()
     tickets = conn.execute(
         """
         SELECT t.slip_date, t.ticket_no, t.net_weight,
@@ -652,27 +820,471 @@ def get_day_readback(conn: sqlite3.Connection, slip_date: str) -> dict[str, obje
     ).fetchall()
     return {
         "date": day,
+        "generation": int(generation_row["generation"]) if generation_row else 0,
         "tickets": [dict(row) for row in tickets],
         "missing_holds": [dict(row) for row in missing_holds],
     }
 
 
-def get_ticket_readback(conn: sqlite3.Connection, slip_date: str, ticket_no: str) -> dict[str, object]:
-    day = parse_iso_date(slip_date, "日期").isoformat()
-    ticket_no = (ticket_no or "").strip()
-    if not ticket_no:
-        raise ValidationError("单号不能为空")
-    with read_transaction(conn):
-        ticket = _get_ticket_row(conn, day, ticket_no)
-        hold = conn.execute(
-            "SELECT slip_date, ticket_no, reason, created_at FROM holds WHERE slip_date=? AND ticket_no=?",
-            (day, ticket_no),
-        ).fetchone()
+# ---------------------------------------------------------------------------
+# Compare-before-commit precheck
+# ---------------------------------------------------------------------------
+
+PRECHECK_DAYS = 7
+PRECHECK_MIN_TICKETS = 100
+PRECHECK_MIN_RATIO = 95  # percent, enforced on each side independently
+STATE_PENDING = "pending"
+STATE_CONFIRMED = "confirmed"
+
+
+def precheck_window(day: date) -> tuple[date, date]:
+    """Seven calendar days before and after, crossing year boundaries."""
+    return day - timedelta(days=PRECHECK_DAYS), day + timedelta(days=PRECHECK_DAYS)
+
+
+def _ticket_pairs(ticket_map: dict[str, int]) -> list[list[object]]:
+    return [[no, ticket_map[no]] for no in sorted(ticket_map)]
+
+
+def _meets_overlap(target_count: int, other_count: int, matched: int) -> bool:
+    """Both ratios must independently reach the threshold.
+
+    A day only qualifies when it has at least the ticket floor itself, so a
+    hundred-ticket target and a ten-ticket neighbor can never hit it. That
+    keeps the per-day comparison work bounded by candidate size only.
+    """
+    if target_count < PRECHECK_MIN_TICKETS or other_count < PRECHECK_MIN_TICKETS:
+        return False
+    return (
+        matched * 100 >= PRECHECK_MIN_RATIO * target_count
+        and matched * 100 >= PRECHECK_MIN_RATIO * other_count
+    )
+
+
+def _overlap_payload(
+    other_day: str, target_count: int, other_count: int, matched: int
+) -> dict[str, object]:
     return {
-        "ticket": dict(ticket) if ticket else None,
-        "hold": dict(hold) if hold else None,
-        "held": hold is not None,
+        "date": other_day,
+        "target_count": target_count,
+        "other_count": other_count,
+        "matched": matched,
+        "target_ratio": round(matched * 100.0 / target_count, 2),
+        "other_ratio": round(matched * 100.0 / other_count, 2),
     }
+
+
+def _json_text(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _json_load(text: str) -> object:
+    return json.loads(text)
+
+
+def _day_generation(conn: sqlite3.Connection, day: str) -> int:
+    row = conn.execute(
+        "SELECT generation FROM day_reports WHERE slip_date = ?", (day,)
+    ).fetchone()
+    return int(row["generation"]) if row else 0
+
+
+def _window_reports(
+    conn: sqlite3.Connection, window_start: str, window_end: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT slip_date, generation, ticket_count
+        FROM day_reports
+        WHERE slip_date BETWEEN ? AND ?
+        ORDER BY slip_date
+        """,
+        (window_start, window_end),
+    ).fetchall()
+
+
+def _compare_with_window(
+    conn: sqlite3.Connection,
+    target_day: str,
+    target_map: dict[str, int],
+    window_start: str,
+    window_end: str,
+) -> tuple[list[dict[str, object]], int]:
+    """Compare a report against reported neighbors inside the window.
+
+    Returns (hits, inspected). Only days that are already reported, inside the
+    window, and at the 100-ticket floor are inspected; the target date itself
+    is skipped so its outgoing copy is never compared with itself.
+
+    The incoming ticket numbers go into a connection-local temp table and the
+    match is an indexed EXISTS probe. Work therefore scales with the incoming
+    report and the matches, not with the number of non-overlapping tickets a
+    neighbor happens to carry.
+    """
+    rows = _window_reports(conn, window_start, window_end)
+    target_count = len(target_map)
+    hits: list[dict[str, object]] = []
+    inspected = 0
+
+    # Candidate days are decided from the small day_reports metadata, never
+    # from their ticket rows. Days below the floor or outside the window are
+    # never scanned, so the daily comparison cost does not grow with tickets
+    # on neighbor days that cannot share the incoming batch.
+    candidates = [
+        row
+        for row in rows
+        if row["slip_date"] != target_day
+        and int(row["ticket_count"]) >= PRECHECK_MIN_TICKETS
+    ]
+    if target_count < PRECHECK_MIN_TICKETS or not candidates:
+        return hits, inspected
+
+    conn.execute("DROP TABLE IF EXISTS temp.precheck_incoming")
+    conn.execute(
+        """
+        CREATE TEMP TABLE precheck_incoming (
+            ticket_no  TEXT PRIMARY KEY,
+            net_weight INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.executemany(
+        "INSERT INTO precheck_incoming(ticket_no, net_weight) VALUES (?, ?)",
+        [(no, weight) for no, weight in target_map.items()],
+    )
+
+    for row in candidates:
+        other_day = row["slip_date"]
+        other_count = int(row["ticket_count"])
+        inspected += 1
+        # The EXISTS probe drives the incoming temp table and looks each
+        # ticket up by the tickets primary key. It touches only matching rows,
+        # so a neighbor with many non-overlapping tickets costs nothing extra.
+        matched = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM precheck_incoming AS i
+                WHERE EXISTS (
+                    SELECT 1 FROM tickets AS t
+                    WHERE t.slip_date = ?
+                      AND t.ticket_no = i.ticket_no
+                      AND t.net_weight = i.net_weight
+                )
+                """,
+                (other_day,),
+            ).fetchone()[0]
+        )
+        if _meets_overlap(target_count, other_count, matched):
+            hits.append(_overlap_payload(other_day, target_count, other_count, matched))
+
+    conn.execute("DROP TABLE IF EXISTS temp.precheck_incoming")
+    hits.sort(key=lambda item: (-int(item["matched"]), str(item["date"])))
+    return hits, inspected
+
+
+def allocate_submission(conn: sqlite3.Connection) -> int:
+    """Public entry point: stamp an upload with its submission order."""
+    with write_transaction(conn):
+        return _allocate_submission_seq(conn)
+
+
+def precheck_tickets(
+    conn: sqlite3.Connection,
+    slip_date: str,
+    tickets: list[tuple[str, int]],
+    *,
+    submission_seq: Optional[int] = None,
+) -> dict[str, object]:
+    """Dry-run a day report against neighbors without writing any tickets.
+
+    If a neighbor hits the overlap rule, a pending precheck stores the exact
+    ticket list and overlap evidence for a quality reviewer. A hit precheck
+    never writes tickets and never touches the subtotal tables. The caller may
+    pass the submission order it already stamped; otherwise one is allocated
+    here so a later upload can still supersede this one.
+    """
+    day = parse_iso_date(slip_date, "上传日期")
+    target_day = day.isoformat()
+    window_start, window_end = (d.isoformat() for d in precheck_window(day))
+    target_map = {no: weight for no, weight in tickets}
+
+    # The submission is stamped first, in a very short write transaction. The
+    # comparison itself then runs in a read transaction: in WAL mode a writer
+    # outside the window (or even inside it) is not blocked while the slower
+    # comparison is still running.
+    if submission_seq is None:
+        with write_transaction(conn):
+            seq = _allocate_submission_seq(conn)
+    else:
+        seq = submission_seq
+
+    with read_transaction(conn):
+        # Snapshot the window generations *before* comparing. Both come from
+        # the same read snapshot, so if any window day is re-reported while the
+        # comparison runs, confirmation later sees the newer generation and
+        # refuses. Reading them afterwards would let a concurrent write slip
+        # into the stored baseline and make a stale review look current.
+        window_generations = {
+            row["slip_date"]: int(row["generation"])
+            for row in _window_reports(conn, window_start, window_end)
+        }
+        hits, inspected = _compare_with_window(
+            conn, target_day, target_map, window_start, window_end
+        )
+
+    superseded: list[int] = []
+    precheck_id: Optional[int] = None
+    if hits:
+        with write_transaction(conn):
+            # A newer dry run replaces earlier undecided prechecks for the same
+            # report date; confirmed rows stay as an audit trail. If a newer
+            # submission already wrote this date while the comparison ran, the
+            # result is stale before it is even stored.
+            latest_write = conn.execute(
+                "SELECT last_written FROM day_write_order WHERE slip_date = ?",
+                (target_day,),
+            ).fetchone()
+            if latest_write is not None and int(latest_write["last_written"]) > seq:
+                raise PrecheckStale(
+                    "核对期间该日已有更晚提交的日报写入，本次预检已过期，请重新上传核对",
+                    stale_dates=[target_day],
+                )
+            stale = conn.execute(
+                "SELECT id FROM precheck_reports WHERE target_date = ? AND state = ?",
+                (target_day, STATE_PENDING),
+            ).fetchall()
+            for row in stale:
+                superseded.append(int(row["id"]))
+                conn.execute(
+                    "DELETE FROM precheck_reports WHERE id = ?", (int(row["id"]),)
+                )
+
+            cursor = conn.execute(
+                """
+                INSERT INTO precheck_reports(
+                    target_date, target_gen, target_count, window_start, window_end,
+                    window_json, ticket_json, matches_json, match_count,
+                    submission_seq, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_day,
+                    _day_generation(conn, target_day),
+                    len(target_map),
+                    window_start,
+                    window_end,
+                    _json_text(window_generations),
+                    _json_text(_ticket_pairs(target_map)),
+                    _json_text(hits),
+                    len(hits),
+                    seq,
+                    STATE_PENDING,
+                ),
+            )
+            precheck_id = int(cursor.lastrowid)
+
+    return {
+        "date": target_day,
+        "window_start": window_start,
+        "window_end": window_end,
+        "ticket_count": len(target_map),
+        "inspected_days": inspected,
+        "matches": hits,
+        "hit": bool(hits),
+        "match_count": len(hits),
+        "precheck_id": precheck_id,
+        "submission_seq": seq,
+        "superseded_pending": superseded,
+        "required_tickets": PRECHECK_MIN_TICKETS,
+        "required_ratio": PRECHECK_MIN_RATIO,
+    }
+
+
+def commit_reported_day(
+    conn: sqlite3.Connection,
+    slip_date: str,
+    tickets: list[tuple[str, int]],
+    *,
+    submission_seq: Optional[int] = None,
+    submitted_at: Optional[str] = None,
+    submitted_by: Optional[str] = None,
+) -> dict[str, object]:
+    """Commit a hit-free report directly.
+
+    The report keeps the submission order captured when it was uploaded, so
+    if a later submission already wrote this date, the older one is refused.
+    Otherwise the whole-day replacement runs in one write transaction: the
+    last report submitted before the write is the one that lands. The
+    precheck only gates hit reports; holds and subtotals stay transactionally
+    consistent with the ticket rows.
+    """
+    day = parse_iso_date(slip_date, "上传日期")
+    target_day = day.isoformat()
+    with write_transaction(conn):
+        seq = (
+            submission_seq
+            if submission_seq is not None
+            else _allocate_submission_seq(conn)
+        )
+        before = conn.execute(
+            "SELECT generation FROM day_reports WHERE slip_date = ?", (target_day,)
+        ).fetchone()
+        try:
+            result = _replace_day_tickets_locked(conn, target_day, tickets, seq)
+        except _Superseded:
+            raise PrecheckStale(
+                "该日已有更晚提交的日报写入，本次上传已过期，请重新核对",
+                stale_dates=[target_day],
+            ) from None
+        result["reviewed_generation"] = int(before["generation"]) if before else 0
+        result["submission_seq"] = seq
+        result["submitted_at"] = submitted_at
+        result["submitted_by"] = submitted_by
+    return result
+
+
+class PrecheckStale(ValidationError):
+    """A pending precheck no longer describes the current window."""
+
+    def __init__(self, message: str, stale_dates: Optional[list[str]] = None):
+        super().__init__(message)
+        self.stale_dates = list(stale_dates or [])
+
+
+def _stale_dates_for(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> list[str]:
+    """Days this precheck is no longer a valid review basis for.
+
+    The target day is checked by generation, so any new report or replacement
+    after the precheck invalidates it even when the ticket set is identical.
+    Neighbor days use the same stored generation snapshot. Both checks are
+    O(days in window) and independent of ticket volume.
+    """
+    window_generations: dict[str, int] = _json_load(row["window_json"])  # type: ignore[assignment]
+    current: dict[str, int] = {
+        report_row["slip_date"]: int(report_row["generation"])
+        for report_row in _window_reports(
+            conn, row["window_start"], row["window_end"]
+        )
+    }
+    changed: list[str] = []
+    for day in sorted(set(window_generations) | set(current)):
+        if window_generations.get(day) != current.get(day):
+            changed.append(day)
+    return changed
+
+
+def confirm_precheck(
+    conn: sqlite3.Connection,
+    precheck_id: int,
+    *,
+    submitted_at: Optional[str] = None,
+    submitted_by: Optional[str] = None,
+) -> dict[str, object]:
+    """Commit the exact ticket list a reviewer saw, if still current.
+
+    Stale means the target day itself or any reported day inside the
+    seven-day window got a new report after this precheck was computed, or a
+    later submission already wrote the target day. In all cases confirmation
+    is refused and the report must be prechecked again.
+    """
+    with write_transaction(conn):
+        row = conn.execute(
+            "SELECT * FROM precheck_reports WHERE id = ?", (precheck_id,)
+        ).fetchone()
+        if row is None:
+            raise ValidationError("预检记录不存在，请重新上传核对")
+        if row["state"] != STATE_PENDING:
+            raise ValidationError("该预检已确认过，请勿重复提交")
+
+        stale_dates = _stale_dates_for(conn, row)
+        if stale_dates:
+            raise PrecheckStale(
+                "预检后目标日或窗口内有日报新报或换报，必须重新核对后才能确认",
+                stale_dates=stale_dates,
+            )
+
+        target_day = row["target_date"]
+        ticket_pairs = _json_load(row["ticket_json"])
+        tickets = [(str(no), int(weight)) for no, weight in ticket_pairs]
+        # Confirmation keeps the submission order recorded when the reviewer
+        # started, so a newer report that already committed wins over an older
+        # confirmation that arrives late.
+        seq = int(row["submission_seq"])
+        if seq <= 0:
+            seq = _allocate_submission_seq(conn)
+        try:
+            result = _replace_day_tickets_locked(conn, target_day, tickets, seq)
+        except _Superseded:
+            raise PrecheckStale(
+                "该日已有更晚提交的日报写入，本次确认已过期，必须重新核对",
+                stale_dates=[target_day],
+            ) from None
+        conn.execute(
+            """
+            UPDATE precheck_reports
+            SET state = ?, confirmed_at = datetime('now'),
+                submitted_at = COALESCE(?, datetime('now')), submitted_by = ?
+            WHERE id = ?
+            """,
+            (STATE_CONFIRMED, submitted_at, submitted_by, precheck_id),
+        )
+
+    return {
+        "precheck_id": precheck_id,
+        "date": target_day,
+        "matches": _json_load(row["matches_json"]),
+        "match_count": int(row["match_count"]),
+        "generation": int(result["generation"]),
+        "old_count": int(result["old_count"]),
+        "new_count": int(result["new_count"]),
+    }
+
+
+def _pending_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "target_date": row["target_date"],
+        "target_count": int(row["target_count"]),
+        "window_start": row["window_start"],
+        "window_end": row["window_end"],
+        "matches": _json_load(row["matches_json"]),
+        "match_count": int(row["match_count"]),
+        "state": row["state"],
+        "created_at": row["created_at"],
+        "stale_dates": _stale_dates_for(conn, row),
+        "tickets": _json_load(row["ticket_json"]),
+    }
+
+
+def list_pending_prechecks(
+    conn: sqlite3.Connection, target_date: Optional[str] = None
+) -> list[dict[str, object]]:
+    if target_date:
+        day = parse_iso_date(target_date, "日期").isoformat()
+        rows = conn.execute(
+            """
+            SELECT * FROM precheck_reports
+            WHERE state = ? AND target_date = ?
+            ORDER BY id DESC
+            """,
+            (STATE_PENDING, day),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM precheck_reports WHERE state = ? ORDER BY id DESC",
+            (STATE_PENDING,),
+        ).fetchall()
+    return [_pending_payload(conn, row) for row in rows]
+
+
+def get_precheck(conn: sqlite3.Connection, precheck_id: int) -> Optional[dict[str, object]]:
+    row = conn.execute(
+        "SELECT * FROM precheck_reports WHERE id = ?", (precheck_id,)
+    ).fetchone()
+    return _pending_payload(conn, row) if row is not None else None
 
 
 # ---------------------------------------------------------------------------
